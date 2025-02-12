@@ -119,7 +119,7 @@ pub fn execute(
 
 pub mod execute {
     use cosmwasm_std::{Addr, CosmosMsg, StdError, Uint128, WasmMsg};
-    use cw20::Cw20ExecuteMsg;
+    use cw20::{AllowanceResponse, BalanceResponse, Cw20ExecuteMsg, Cw20QueryMsg};
 
     use crate::state::{
         Job, JobStatus, Profile, ProfileType, SocialLink, JOBS, PROFILES, PROPOSALS,
@@ -237,8 +237,45 @@ pub mod execute {
         }
 
         // Validate deadline
-        if deadline <= env.block.time.seconds() {
-            return Err(StdError::generic_err("Deadline must be in the future"));
+        if env.block.time.seconds() > u64::MAX - deadline {
+            return Err(StdError::generic_err("Deadline too far in the future"));
+        }
+
+        // Calculate future deadline safely
+        let future_deadline = env
+            .block
+            .time
+            .seconds()
+            .checked_add(deadline)
+            .ok_or_else(|| {
+                StdError::generic_err("Failed to calculate future deadline due to overflow")
+            })?;
+
+        let state = STATE.load(deps.storage)?;
+
+        // Add allowance check
+        let allowance: AllowanceResponse = deps.querier.query_wasm_smart(
+            state.token_address.clone(),
+            &Cw20QueryMsg::Allowance {
+                owner: info.sender.to_string(),
+                spender: env.contract.address.to_string(),
+            },
+        )?;
+
+        if allowance.allowance < budget {
+            return Err(StdError::generic_err("Insufficient allowance"));
+        }
+
+        // Check token balance
+        let balance: BalanceResponse = deps.querier.query_wasm_smart(
+            state.token_address.clone(),
+            &Cw20QueryMsg::Balance {
+                address: info.sender.to_string(),
+            },
+        )?;
+
+        if balance.balance < budget {
+            return Err(StdError::generic_err("Insufficient token balance"));
         }
 
         // Generate unique job ID (using timestamp + client address)
@@ -256,12 +293,10 @@ pub mod execute {
             description,
             budget,
             status: JobStatus::Open,
-            deadline,
+            deadline: future_deadline,
             deliverables,
             submission: None,
         };
-
-        let state = STATE.load(deps.storage)?;
 
         let mut messages: Vec<CosmosMsg> = vec![];
 
